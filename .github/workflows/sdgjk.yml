@@ -1,0 +1,228 @@
+name: Nexus CLI (4 nodes, persist state)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"   # chạy mỗi 5 giờ để kịp backup trước mốc 6h
+
+permissions:
+  contents: read
+  actions: read
+
+# KHÓA theo TỪNG FILE WORKFLOW, không chặn file khác
+# -> mỗi *.yml có thể chạy song song; RIÊNG TỪNG FILE vẫn chỉ 1 run tại một thời điểm
+concurrency:
+  group: ${{ github.workflow_ref }}   # ví dụ: owner/repo/.github/workflows/t3.yml@refs/heads/main
+  cancel-in-progress: false           # run mới sẽ đợi, không hủy run cũ (để kịp backup)
+
+env:
+  NODE_IDS: "36279167 36441917 36303502 36437967"
+  LOG_MAX_MB: "50"                    # giới hạn log trong snapshot (MB)
+
+jobs:
+  nexus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1) Restore state (best-effort nếu chưa có artifact)
+      - name: Download previous state artifact (best-effort)
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          name: nexus-state
+          path: /tmp/nexus-state
+          if_no_artifact_found: ignore
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore state (if present)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /opt/state
+          sudo chown -R "$USER:$USER" /opt/state
+
+          # Khôi phục ~/.nexus (nếu có)
+          [ -f /tmp/nexus-state/home-runner-nexus.tar.gz ] && \
+            tar -xzf /tmp/nexus-state/home-runner-nexus.tar.gz -C "$HOME" || true
+
+          # Khôi phục /opt/state (nếu có)
+          if [ -f /tmp/nexus-state/opt-state.tar.gz ]; then
+            sudo tar -xzf /tmp/nexus-state/opt-state.tar.gz -C /
+            sudo chown -R "$USER:$USER" /opt/state
+          fi
+
+          mkdir -p /opt/state/logs
+
+      - name: Prepare system
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y -q tmux curl rsync
+
+      # 2) Cài Nexus CLI (robust: bash + retry + HTML guard)
+      - name: Install Nexus CLI (robust)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Tải script về file (retry tăng dần)
+          for i in {1..5}; do
+            curl -fsSL -A "curl/8.x github-actions" https://cli.nexus.xyz -o /tmp/nexus-install.sh && break || sleep $((5*i))
+          done
+
+          # In 5 dòng đầu để debug
+          head -n 5 /tmp/nexus-install.sh || true
+
+          # Guard: nếu trả về HTML/redirect thì fail sớm
+          if grep -qiE '<(html|head|title|script)' /tmp/nexus-install.sh; then
+            echo "Installer returned HTML (có thể bị redirect/protection)."
+            exit 1
+          fi
+
+          # Chạy bằng bash (không dùng sh/dash)
+          bash /tmp/nexus-install.sh
+
+          # Thêm path binary do installer đặt trong ~/.nexus/bin
+          echo "$HOME/.nexus/bin" >> "$GITHUB_PATH"
+
+      # 3) Script chạy node (shebang ở cột 1)
+      - name: Ensure start script exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+          install -d -m 755 /opt/state /opt/state/logs
+
+          cat <<'SCRIPT' | sed 's/^[[:space:]]*//' > /opt/state/start-nexus.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          NODE_ID="$1"
+          LOG_DIR="/opt/state/logs"
+          LOG_FILE="${LOG_DIR}/node${NODE_ID}.log"
+
+          mkdir -p "$LOG_DIR"
+
+          # Binaries từ CLI
+          export PATH="$HOME/.nexus/bin:$PATH"
+
+          # In version nếu có, không fail nếu vắng
+          command -v nexus-network && nexus-network --version || true
+
+          # Watchdog: nếu log đứng > 15 phút thì restart
+          IDLE_MAX_MIN=${IDLE_MAX_MIN:-15}
+
+          while true; do
+            echo "[$(date -Is)] starting node ${NODE_ID}"
+
+            ( stdbuf -oL -eL nexus-network start --node-id "${NODE_ID}" 2>&1 | tee -a "${LOG_FILE}" ) &
+            NPID=$!
+
+            while kill -0 "$NPID" 2>/dev/null; do
+              sleep 60
+              if [ -f "${LOG_FILE}" ]; then
+                LAST=$(stat -c %Y "${LOG_FILE}") || LAST=0
+                NOW=$(date +%s)
+                if [ $((NOW - LAST)) -gt $((IDLE_MAX_MIN*60)) ]; then
+                  echo "[$(date -Is)] no log > ${IDLE_MAX_MIN}m → restart ${NODE_ID}"
+                  kill -TERM "$NPID" 2>/dev/null || true
+                  sleep 5
+                  kill -KILL "$NPID" 2>/dev/null || true
+                  break
+                fi
+              fi
+            done
+
+            echo "[$(date -Is)] node ${NODE_ID} exited, restart in 15s..."
+            sleep 15
+          done
+          SCRIPT
+
+          chmod +x /opt/state/start-nexus.sh
+          head -n 20 /opt/state/start-nexus.sh
+
+      # 4) Khởi chạy 4 node trong tmux socket riêng 'nexus' (stagger + nice/ionice)
+      - name: Start 4 Nexus nodes in tmux (stagger + nice/ionice)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # Dọn session cũ (nếu có) theo từng node
+          for ID in $NODE_IDS; do
+            tmux -L nexus has-session -t "node${ID}" 2>/dev/null && \
+              tmux -L nexus kill-session -t "node${ID}" || true
+          done
+
+          i=0
+          for ID in $NODE_IDS; do
+            SLEEP=$((5 + (RANDOM % 11) + i*2))   # giãn khởi động giảm spike
+            echo "Stagger start node ${ID} sau ${SLEEP}s"
+            sleep "${SLEEP}"
+
+            tmux -L nexus new-session -d -s "node${ID}" \
+              "nice -n 5 ionice -c2 -n5 /opt/state/start-nexus.sh ${ID}"
+
+            i=$((i+1))
+          done
+
+          tmux -L nexus ls || true
+
+      # 5) SSH debug (thủ công; hoặc bật bởi repo variable ENABLE_TMATE=1)
+      - name: Open tmate (debug)
+        if: ${{ github.event_name == 'workflow_dispatch' || vars.ENABLE_TMATE == '1' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false
+
+      # 6) Chạy ~5h50' rồi snapshot + upload
+      - name: Let it run
+        shell: bash
+        run: |
+          sleep $((5*60*60 + 50*60))
+
+      # 7) Snapshot ổn định + giới hạn log + nén
+      - name: Create state archives
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/state-bundle
+
+          # ~/.nexus (nếu có)
+          if [ -d "$HOME/.nexus" ]; then
+            tar -czf /tmp/state-bundle/home-runner-nexus.tar.gz -C "$HOME" .nexus
+          fi
+
+          # /opt/state → snapshot bằng rsync
+          if [ -d /opt/state ]; then
+            SNAP=/tmp/snap/opt/state
+            mkdir -p "$SNAP"
+            rsync -a --delete /opt/state/ "$SNAP/"
+
+            # cắt log về LOG_MAX_MB
+            MAX_MB=${LOG_MAX_MB:-50}
+            MAX_BYTES=$((MAX_MB*1024*1024))
+
+            find "$SNAP/logs" -type f -name 'node*.log' 2>/dev/null | while read -r f; do
+              SZ=$(stat -c%s "$f" 2>/dev/null || echo 0)
+              if [ "$SZ" -gt "$MAX_BYTES" ]; then
+                tail -c "$MAX_BYTES" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              fi
+            done
+
+            sudo tar -czf /tmp/state-bundle/opt-state.tar.gz -C /tmp/snap opt/state
+            sudo chown "$USER:$USER" /tmp/state-bundle/opt-state.tar.gz
+          fi
+
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-state
+          path: /tmp/state-bundle
+          retention-days: 14
